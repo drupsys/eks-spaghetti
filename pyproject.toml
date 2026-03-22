@@ -1,5 +1,5 @@
 [project]
-name = "eks-spaghetti"
+name = "0nedark-eks-spaghetti"
 description = ""
 version = "1.0.0"
 license = {file = "LICENSE"} 
@@ -28,9 +28,8 @@ Documentation = "https://github.com/drupsys/eks-spaghetti/wiki"
 "Bug Tracker" = "https://github.com/drupsys/eks-spaghetti/issues"
 
 [tool.comfy]
-PublisherId = "@onedark"
+PublisherId = "onedark"
 DisplayName = "0nedark-eks-spaghetti"
 Icon = ""
 includes = [] 
 # "requires-comfyui" = ">=1.0.0"  # ComfyUI version compatibility
-
