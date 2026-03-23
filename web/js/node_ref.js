@@ -50,7 +50,7 @@ function getRefRegistry() {
                     const link = graph.links[input.link];
                     if (link) {
                         inputs.push({
-                            name: input.name || `in_${i}`,
+                            name: input.label || input.name || `in_${i}`,
                             type: link.type || input.type || "*",
                         });
                     }
@@ -76,6 +76,42 @@ function clearOutputs(node) {
     while (node.outputs.length > 0) {
         node.removeOutput(0);
     }
+}
+
+// ─── Sync helpers ───
+
+function updateNodeRefOutputName(refNode, slotIndex, newName) {
+    const refNameW = refNode.widgets?.find(w => w.name === "ref_name");
+    const rName = refNameW?.value;
+    console.log("[updateNodeRefOutputName] rName:", rName, "slotIndex:", slotIndex, "newName:", newName);
+    if (!rName) return;
+
+    // Find the output index: count connected inputs before this slot
+    let outputIdx = 0;
+    for (let i = 0; i < slotIndex; i++) {
+        if (refNode.inputs[i]?.link != null) outputIdx++;
+    }
+    console.log("[updateNodeRefOutputName] outputIdx:", outputIdx);
+
+    const allNodes = collectAllNodes(getRootGraph());
+    let found = 0;
+    for (const { node } of allNodes) {
+        if (node.type !== POINT_TO_NODE_TYPE) continue;
+        const nrWidget = node.widgets?.find(w => w.name === "ref_name");
+        console.log("[updateNodeRefOutputName] checking NodeRef, ref_name widget value:", nrWidget?.value, "match:", nrWidget?.value === rName);
+        if (nrWidget?.value !== rName) continue;
+        found++;
+        console.log("[updateNodeRefOutputName] NodeRef outputs:", JSON.stringify(node.outputs?.map(o => o.name)));
+        if (node.outputs?.[outputIdx]) {
+            node.outputs[outputIdx].name = newName;
+            node.size = node.computeSize();
+            node.setDirtyCanvas(true, true);
+            console.log("[updateNodeRefOutputName] Updated output", outputIdx, "to", newName);
+        } else {
+            console.log("[updateNodeRefOutputName] No output at index", outputIdx);
+        }
+    }
+    console.log("[updateNodeRefOutputName] Total NodeRef matches:", found);
 }
 
 // ─── Ref Node extension (publisher) ───
@@ -105,6 +141,9 @@ app.registerExtension({
             }
 
             this.title = "Ref ->";
+
+            if (!this.properties) this.properties = {};
+            if (!this.properties._customInputNames) this.properties._customInputNames = {};
 
             const self = this;
 
@@ -136,10 +175,12 @@ app.registerExtension({
                     if (link.type) {
                         this.inputs[slotIndex].type = link.type;
                     }
-                    // Inherit the output name from the source node
-                    const sourceNode = this.graph?.getNodeById(link.origin_id);
-                    if (sourceNode && sourceNode.outputs && sourceNode.outputs[link.origin_slot]) {
-                        this.inputs[slotIndex].name = sourceNode.outputs[link.origin_slot].name;
+                    // Inherit the output name from the source node (unless custom-named)
+                    if (!this.properties._customInputNames?.[String(slotIndex)]) {
+                        const sourceNode = this.graph?.getNodeById(link.origin_id);
+                        if (sourceNode && sourceNode.outputs && sourceNode.outputs[link.origin_slot]) {
+                            this.inputs[slotIndex].name = sourceNode.outputs[link.origin_slot].name;
+                        }
                     }
                 }
             }
@@ -147,6 +188,22 @@ app.registerExtension({
             // Reset disconnected input type back to wildcard
             if (!isConnected && this.inputs[slotIndex]) {
                 this.inputs[slotIndex].type = "*";
+            }
+
+            // Remap custom input names before removing disconnected slots
+            if (this.properties._customInputNames) {
+                const oldCustom = this.properties._customInputNames;
+                const newCustom = {};
+                let newIdx = 0;
+                for (let i = 0; i < this.inputs.length; i++) {
+                    if (this.inputs[i].link != null) {
+                        if (oldCustom[String(i)]) {
+                            newCustom[String(newIdx)] = oldCustom[String(i)];
+                        }
+                        newIdx++;
+                    }
+                }
+                this.properties._customInputNames = newCustom;
             }
 
             // Remove all unconnected inputs, then re-add one empty slot at the end
@@ -162,14 +219,18 @@ app.registerExtension({
                 this.addInput("...", "*");
             }
 
-            // Rename connected inputs from their source output names
+            // Rename connected inputs from their source output names (respecting custom names)
             for (let i = 0; i < this.inputs.length; i++) {
                 if (this.inputs[i].link != null) {
-                    const link = this.graph?.links[this.inputs[i].link];
-                    if (link) {
-                        const srcNode = this.graph?.getNodeById(link.origin_id);
-                        if (srcNode?.outputs?.[link.origin_slot]) {
-                            this.inputs[i].name = srcNode.outputs[link.origin_slot].name;
+                    if (this.properties._customInputNames?.[String(i)]) {
+                        this.inputs[i].name = this.properties._customInputNames[String(i)];
+                    } else {
+                        const link = this.graph?.links[this.inputs[i].link];
+                        if (link) {
+                            const srcNode = this.graph?.getNodeById(link.origin_id);
+                            if (srcNode?.outputs?.[link.origin_slot]) {
+                                this.inputs[i].name = srcNode.outputs[link.origin_slot].name;
+                            }
                         }
                     }
                 }
@@ -179,12 +240,72 @@ app.registerExtension({
             this.setDirtyCanvas(true, true);
         };
 
+        const origGetExtraMenuOptions = nodeType.prototype.getExtraMenuOptions;
+        nodeType.prototype.getExtraMenuOptions = function (canvas, options) {
+            if (origGetExtraMenuOptions) origGetExtraMenuOptions.apply(this, arguments);
+
+            const self = this;
+            const slot = this._lastInputSlotOver;
+
+            if (slot != null && this.inputs[slot] && this.inputs[slot].link != null) {
+                options.push(null); // separator
+                options.push({
+                    content: "Rename Input",
+                    callback: () => {
+                        const currentName = self.inputs[slot].name;
+                        const newName = prompt("Enter new name for this input:", currentName);
+                        if (!newName || !newName.trim()) return;
+                        const trimmed = newName.trim();
+                        if (trimmed === "..." || trimmed === "ref_name") return;
+                        // Check for duplicate names
+                        for (let i = 0; i < self.inputs.length; i++) {
+                            if (i !== slot && self.inputs[i].name === trimmed) return;
+                        }
+                        if (!self.properties._customInputNames) self.properties._customInputNames = {};
+                        self.properties._customInputNames[String(slot)] = trimmed;
+                        self.inputs[slot].name = trimmed;
+                        self.setDirtyCanvas(true, true);
+                        updateNodeRefOutputName(self, slot, trimmed);
+                    }
+                });
+
+                if (this.properties._customInputNames?.[String(slot)]) {
+                    options.push({
+                        content: "Reset Input Name",
+                        callback: () => {
+                            delete self.properties._customInputNames[String(slot)];
+                            let restoredName = self.inputs[slot].name;
+                            const link = self.graph?.links[self.inputs[slot].link];
+                            if (link) {
+                                const srcNode = self.graph?.getNodeById(link.origin_id);
+                                if (srcNode?.outputs?.[link.origin_slot]) {
+                                    restoredName = srcNode.outputs[link.origin_slot].name;
+                                    self.inputs[slot].name = restoredName;
+                                }
+                            }
+                            self.setDirtyCanvas(true, true);
+                            updateNodeRefOutputName(self, slot, restoredName);
+                        }
+                    });
+                }
+            }
+        };
+
         const onConfigure = nodeType.prototype.onConfigure;
         nodeType.prototype.onConfigure = function (info) {
             if (onConfigure) onConfigure.apply(this, arguments);
             const nameWidget = this.widgets?.find(w => w.name === "ref_name");
             if (nameWidget?.value) {
                 this.title = `Ref -> ${nameWidget.value}`;
+            }
+            // Restore custom input names from properties
+            if (this.properties._customInputNames) {
+                for (const [idx, name] of Object.entries(this.properties._customInputNames)) {
+                    const i = parseInt(idx);
+                    if (this.inputs[i] && this.inputs[i].link != null) {
+                        this.inputs[i].name = name;
+                    }
+                }
             }
         };
     },
@@ -217,7 +338,6 @@ function syncOutputsToRef(node) {
 
     // Build the expected output list
     const desired = refInfo.inputs.map(inp => ({ name: inp.name, type: inp.type }));
-
     // Check if actual outputs already match exactly
     const numOutputs = node.outputs?.length || 0;
     if (
