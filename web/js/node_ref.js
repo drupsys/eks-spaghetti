@@ -26,6 +26,18 @@ function collectAllNodes(graph) {
     return results;
 }
 
+function collectAllNodesWithPath(graph, path = []) {
+    const results = [];
+    if (!graph || !graph._nodes) return results;
+    for (const node of graph._nodes) {
+        results.push({ node, graph, path: [...path] });
+        if (node.subgraph) {
+            results.push(...collectAllNodesWithPath(node.subgraph, [...path, node.title || node.type]));
+        }
+    }
+    return results;
+}
+
 // ─── Reference registry ───
 
 function getRefRegistry() {
@@ -78,6 +90,51 @@ function clearOutputs(node) {
     }
 }
 
+// ─── Searchable dropdown ───
+
+function showSearchableMenu(items, x, y, onSelect) {
+    const overlay = document.createElement("div");
+    overlay.style.cssText = "position:fixed;top:0;left:0;width:100%;height:100%;z-index:9999;";
+
+    const panel = document.createElement("div");
+    panel.style.cssText = `position:fixed;left:${x}px;top:${y}px;background:#1e1e1e;border:1px solid #555;border-radius:6px;padding:6px;min-width:250px;max-height:320px;display:flex;flex-direction:column;z-index:10000;font-family:sans-serif;font-size:13px;color:#ccc;box-shadow:0 4px 12px rgba(0,0,0,0.5);`;
+
+    const input = document.createElement("input");
+    input.type = "text";
+    input.placeholder = "Search...";
+    input.style.cssText = "background:#2a2a2a;border:1px solid #555;border-radius:4px;padding:5px 8px;color:#eee;outline:none;margin-bottom:4px;font-size:13px;";
+
+    const list = document.createElement("div");
+    list.style.cssText = "overflow-y:auto;flex:1;";
+
+    function render(filter) {
+        list.innerHTML = "";
+        const filtered = filter ? items.filter(it => it.label.toLowerCase().includes(filter.toLowerCase())) : items;
+        for (const item of filtered) {
+            const row = document.createElement("div");
+            row.textContent = item.label;
+            row.style.cssText = "padding:5px 8px;cursor:pointer;border-radius:3px;white-space:nowrap;";
+            row.addEventListener("mouseenter", () => row.style.background = "#333");
+            row.addEventListener("mouseleave", () => row.style.background = "none");
+            row.addEventListener("click", () => { cleanup(); onSelect(item); });
+            list.appendChild(row);
+        }
+    }
+
+    input.addEventListener("input", () => render(input.value));
+    input.addEventListener("keydown", (e) => { if (e.key === "Escape") cleanup(); });
+
+    function cleanup() { overlay.remove(); panel.remove(); }
+    overlay.addEventListener("click", cleanup);
+
+    panel.appendChild(input);
+    panel.appendChild(list);
+    document.body.appendChild(overlay);
+    document.body.appendChild(panel);
+    input.focus();
+    render("");
+}
+
 // ─── Name helpers ───
 
 function uniqueInputName(node, baseName, slotIndex) {
@@ -119,6 +176,62 @@ function updateNodeRefOutputName(refNode, slotIndex, newName) {
 app.registerExtension({
     name: "0nedark.RefNode",
 
+    commands: [{
+        id: "0nedark.goto-consumers",
+        label: "Goto",
+        icon: "pi pi-arrow-right",
+        function: async () => {
+            const selected = Object.values(app.canvas.selected_nodes || {});
+            const node = selected.find(n => n.type === REF_OF_NODE_TYPE);
+            if (!node) return;
+            const nameW = node.widgets?.find(w => w.name === "ref_name");
+            const rName = nameW?.value;
+            if (!rName) return;
+
+            const allNodes = collectAllNodesWithPath(getRootGraph());
+            const consumers = [];
+            for (const { node: n, graph, path } of allNodes) {
+                if (n.type !== POINT_TO_NODE_TYPE) continue;
+                const nrWidget = n.widgets?.find(w => w.name === "ref_name");
+                if (nrWidget?.value !== rName) continue;
+                const nodeLabel = n.title || n.type;
+                const parts = [...path, nodeLabel];
+                consumers.push({ node: n, graph, label: parts.join(" / ") });
+            }
+
+            if (consumers.length === 0) return;
+
+            const navigateTo = async (c) => {
+                const canvas = app.canvas;
+                if (!canvas) return;
+                const currentGraph = canvas.getCurrentGraph?.() ?? canvas.graph;
+                if (c.graph && c.graph !== currentGraph) {
+                    const fromNode = c.graph._subgraph_node || null;
+                    canvas.openSubgraph(c.graph, fromNode);
+                    await new Promise(r => setTimeout(r, 16));
+                }
+                canvas.centerOnNode(c.node);
+                canvas.selectNode(c.node, false);
+                canvas.setDirty(true, true);
+            };
+
+            if (consumers.length === 1) {
+                await navigateTo(consumers[0]);
+                return;
+            }
+
+            const rect = app.canvas.canvas.getBoundingClientRect();
+            const x = app.canvas.last_mouse[0] + rect.left;
+            const y = app.canvas.last_mouse[1] + rect.top;
+            showSearchableMenu(consumers, x, y, navigateTo);
+        }
+    }],
+
+    getSelectionToolboxCommands(selectedItem) {
+        if (selectedItem?.type === REF_OF_NODE_TYPE) return ["0nedark.goto-consumers"];
+        return [];
+    },
+
     async beforeRegisterNodeDef(nodeType, nodeData, _app) {
         if (nodeData.name !== REF_OF_NODE_TYPE) return;
 
@@ -140,7 +253,7 @@ app.registerExtension({
                 }
             }
 
-            this.title = "Ref ->";
+            this.title = "Ref -> ?";
 
             if (!this.properties) this.properties = {};
             if (!this.properties._customInputNames) this.properties._customInputNames = {};
@@ -152,7 +265,7 @@ app.registerExtension({
                 const origCallback = nameWidget.callback;
                 nameWidget.callback = function (value) {
                     if (origCallback) origCallback.call(this, value);
-                    self.title = value ? `Ref -> ${value}` : "Ref ->";
+                    self.title = value ? `Ref -> ${value}` : "Ref -> ?";
                     self.size = self.computeSize();
                     self.setDirtyCanvas(true, true);
                 };
@@ -160,6 +273,7 @@ app.registerExtension({
                     this.title = `Ref -> ${nameWidget.value}`;
                 }
             }
+
         };
 
         const onConnectionsChange = nodeType.prototype.onConnectionsChange;
@@ -328,6 +442,7 @@ function syncOutputsToRef(node) {
         if (node.outputs && node.outputs.length > 0) {
             clearOutputs(node);
             node.properties._ref_outputs = null;
+            node.title = `? -> Ref (#${node.id})`;
             node.size = node.computeSize();
             node.setDirtyCanvas(true, true);
         }
@@ -388,7 +503,7 @@ function syncOutputsToRef(node) {
         node.properties._ref_outputs = desired.map((d, i) => ({
             name: d.name, type: d.type, origIndex: i
         }));
-        node.title = refName ? `${refName} -> Ref` : "-> Ref";
+        node.title = `${refName} -> Ref (#${node.id})`;
         node.size = node.computeSize();
         node.setDirtyCanvas(true, true);
     }
@@ -396,6 +511,43 @@ function syncOutputsToRef(node) {
 
 app.registerExtension({
     name: "0nedark.NodeRef",
+
+    commands: [{
+        id: "0nedark.goto-producer",
+        label: "Goto",
+        icon: "pi pi-arrow-left",
+        function: async () => {
+            const selected = Object.values(app.canvas.selected_nodes || {});
+            const node = selected.find(n => n.type === POINT_TO_NODE_TYPE);
+            if (!node) return;
+            const refNameW = node.widgets?.find(w => w.name === "ref_name");
+            const name = refNameW?.value;
+            if (!name || name === "None" || name === "") return;
+
+            const registry = getRefRegistry();
+            const refInfo = registry[name];
+            if (!refInfo || !refInfo.refNode) return;
+
+            const canvas = app.canvas;
+            if (!canvas) return;
+
+            const currentGraph = canvas.getCurrentGraph?.() ?? canvas.graph;
+            if (refInfo.graph && refInfo.graph !== currentGraph) {
+                const fromNode = refInfo.graph._subgraph_node || null;
+                canvas.openSubgraph(refInfo.graph, fromNode);
+                await new Promise(r => setTimeout(r, 16));
+            }
+
+            canvas.centerOnNode(refInfo.refNode);
+            canvas.selectNode(refInfo.refNode, false);
+            canvas.setDirty(true, true);
+        }
+    }],
+
+    getSelectionToolboxCommands(selectedItem) {
+        if (selectedItem?.type === POINT_TO_NODE_TYPE) return ["0nedark.goto-producer"];
+        return [];
+    },
 
     async setup() {
         // Patch graphToPrompt to inject _ref_trigger dependency from RefNode to NodeRef
@@ -467,38 +619,9 @@ app.registerExtension({
                     values: () => getRefNameList(),
                 }
             );
+            this.refNameCombo.serializeValue = () => undefined;
 
-            // Goto button — navigates to the correct subgraph and centers on the Ref Node
-            this.addWidget("button", "Goto", null, async function () {
-                const refNameW = self.widgets?.find(w => w.name === "ref_name");
-                const name = refNameW?.value;
-                if (!name || name === "None" || name === "") return;
-
-                const registry = getRefRegistry();
-                const refInfo = registry[name];
-                if (!refInfo || !refInfo.refNode) return;
-
-                const refNode = refInfo.refNode;
-                const targetGraph = refInfo.graph;
-                const canvas = app.canvas;
-                if (!canvas) return;
-
-                const currentGraph = canvas.getCurrentGraph?.() ?? canvas.graph;
-                if (targetGraph && targetGraph !== currentGraph) {
-                    // Find the subgraph node that owns the target graph
-                    // (the node you'd double-click to enter it)
-                    const fromNode = targetGraph._subgraph_node || null;
-                    canvas.openSubgraph(targetGraph, fromNode);
-                    // Wait for graph switch to settle
-                    await new Promise(r => setTimeout(r, 16));
-                }
-
-                canvas.centerOnNode(refNode);
-                canvas.selectNode(refNode, false);
-                canvas.setDirty(true, true);
-            });
-
-            this.title = "-> Ref";
+            this.title = `? -> Ref (#${this.id})`;
         };
 
         // Auto-refresh outputs when the referenced Ref Node's connections change
@@ -516,7 +639,7 @@ app.registerExtension({
             const refName = refNameWidget?.value;
 
             if (refName && refName !== "None" && refName !== "") {
-                this.title = `${refName} -> Ref`;
+                this.title = `${refName} -> Ref (#${this.id})`;
 
                 if (this.refNameCombo) {
                     this.refNameCombo.value = refName;
