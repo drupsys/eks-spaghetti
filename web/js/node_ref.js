@@ -239,19 +239,22 @@ app.registerExtension({
         nodeType.prototype.onNodeCreated = function () {
             if (onNodeCreated) onNodeCreated.apply(this, arguments);
 
+            // Wipe default inputs/outputs from INPUT_TYPES
             if (this.inputs) {
-                while (this.inputs.length > 0) {
-                    this.removeInput(0);
-                }
+                while (this.inputs.length > 0) this.removeInput(0);
             }
-            this.addInput("...", "*");
-
-            // Hide the trigger output (used internally for execution ordering)
             if (this.outputs) {
-                while (this.outputs.length > 0) {
-                    this.removeOutput(0);
-                }
+                while (this.outputs.length > 0) this.removeOutput(0);
             }
+
+            // For new nodes (no configure call), add "..." placeholder after a tick
+            const self_init = this;
+            setTimeout(() => {
+                if (!self_init.inputs?.length) {
+                    self_init.addInput("...", "*");
+                    self_init.size = self_init.computeSize();
+                }
+            }, 0);
 
             this.title = "Ref -> ?";
 
@@ -276,12 +279,20 @@ app.registerExtension({
 
         };
 
+        const origConfigure = nodeType.prototype.configure;
+        nodeType.prototype.configure = function (info) {
+            this._isRestoring = true;
+            if (origConfigure) origConfigure.apply(this, arguments);
+            this._isRestoring = false;
+        };
+
         const onConnectionsChange = nodeType.prototype.onConnectionsChange;
         nodeType.prototype.onConnectionsChange = function (type, slotIndex, isConnected, linkInfo, ioSlot) {
             if (onConnectionsChange) onConnectionsChange.apply(this, arguments);
 
             if (type !== 1) return;
             if (!this.inputs) return;
+            if (this._isRestoring) return;
 
             if (isConnected && linkInfo && this.inputs[slotIndex]) {
                 const link = this.graph?.links[linkInfo.id || linkInfo];
@@ -321,9 +332,9 @@ app.registerExtension({
                 this.properties._customInputNames = newCustom;
             }
 
-            // Remove all unconnected inputs, then re-add one empty slot at the end
+            // Remove only empty placeholder inputs (not real inputs awaiting reconnection)
             for (let i = this.inputs.length - 1; i >= 0; i--) {
-                if (this.inputs[i].link == null) {
+                if (this.inputs[i].link == null && this.inputs[i].name === "..." && !this.inputs[i].label) {
                     this.removeInput(i);
                 }
             }
@@ -416,11 +427,32 @@ app.registerExtension({
             if (nameWidget?.value) {
                 this.title = `Ref -> ${nameWidget.value}`;
             }
+
+            // Ensure trailing "..." placeholder exists
+            const lastInput = this.inputs?.[this.inputs.length - 1];
+            if (!this.inputs?.length || (lastInput && lastInput.link != null)) {
+                this.addInput("...", "*");
+            }
+
+            // Remove trigger output if present (restored by LiteGraph serialization)
+            if (this.outputs) {
+                while (this.outputs.length > 0) this.removeOutput(0);
+            }
+
+            // Restore input labels from serialized data
+            if (info.inputs) {
+                for (let i = 0; i < info.inputs.length; i++) {
+                    if (this.inputs[i] && info.inputs[i].label) {
+                        this.inputs[i].label = info.inputs[i].label;
+                    }
+                }
+            }
+
             // Restore custom input names from properties
             if (this.properties._customInputNames) {
                 for (const [idx, name] of Object.entries(this.properties._customInputNames)) {
                     const i = parseInt(idx);
-                    if (this.inputs[i] && this.inputs[i].link != null) {
+                    if (this.inputs[i]) {
                         this.inputs[i].name = name;
                     }
                 }
