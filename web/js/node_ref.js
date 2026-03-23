@@ -78,40 +78,40 @@ function clearOutputs(node) {
     }
 }
 
+// ─── Name helpers ───
+
+function uniqueInputName(node, baseName, slotIndex) {
+    let name = baseName;
+    let counter = 1;
+    while (node.inputs.some((inp, i) => i !== slotIndex && inp.link != null && inp.name === name)) {
+        name = `${baseName}_${counter++}`;
+    }
+    return name;
+}
+
 // ─── Sync helpers ───
 
 function updateNodeRefOutputName(refNode, slotIndex, newName) {
     const refNameW = refNode.widgets?.find(w => w.name === "ref_name");
     const rName = refNameW?.value;
-    console.log("[updateNodeRefOutputName] rName:", rName, "slotIndex:", slotIndex, "newName:", newName);
     if (!rName) return;
 
-    // Find the output index: count connected inputs before this slot
     let outputIdx = 0;
     for (let i = 0; i < slotIndex; i++) {
         if (refNode.inputs[i]?.link != null) outputIdx++;
     }
-    console.log("[updateNodeRefOutputName] outputIdx:", outputIdx);
 
     const allNodes = collectAllNodes(getRootGraph());
-    let found = 0;
     for (const { node } of allNodes) {
         if (node.type !== POINT_TO_NODE_TYPE) continue;
         const nrWidget = node.widgets?.find(w => w.name === "ref_name");
-        console.log("[updateNodeRefOutputName] checking NodeRef, ref_name widget value:", nrWidget?.value, "match:", nrWidget?.value === rName);
         if (nrWidget?.value !== rName) continue;
-        found++;
-        console.log("[updateNodeRefOutputName] NodeRef outputs:", JSON.stringify(node.outputs?.map(o => o.name)));
         if (node.outputs?.[outputIdx]) {
             node.outputs[outputIdx].name = newName;
             node.size = node.computeSize();
             node.setDirtyCanvas(true, true);
-            console.log("[updateNodeRefOutputName] Updated output", outputIdx, "to", newName);
-        } else {
-            console.log("[updateNodeRefOutputName] No output at index", outputIdx);
         }
     }
-    console.log("[updateNodeRefOutputName] Total NodeRef matches:", found);
 }
 
 // ─── Ref Node extension (publisher) ───
@@ -179,7 +179,8 @@ app.registerExtension({
                     if (!this.properties._customInputNames?.[String(slotIndex)]) {
                         const sourceNode = this.graph?.getNodeById(link.origin_id);
                         if (sourceNode && sourceNode.outputs && sourceNode.outputs[link.origin_slot]) {
-                            this.inputs[slotIndex].name = sourceNode.outputs[link.origin_slot].name;
+                            const baseName = sourceNode.outputs[link.origin_slot].name;
+                            this.inputs[slotIndex].name = uniqueInputName(this, baseName, slotIndex);
                         }
                     }
                 }
@@ -219,17 +220,20 @@ app.registerExtension({
                 this.addInput("...", "*");
             }
 
-            // Rename connected inputs from their source output names (respecting custom names)
+            // Rename connected inputs from their source output names (respecting custom names and labels)
             for (let i = 0; i < this.inputs.length; i++) {
                 if (this.inputs[i].link != null) {
-                    if (this.properties._customInputNames?.[String(i)]) {
+                    if (this.inputs[i].label) {
+                        // LiteGraph built-in rename — keep it
+                    } else if (this.properties._customInputNames?.[String(i)]) {
                         this.inputs[i].name = this.properties._customInputNames[String(i)];
                     } else {
                         const link = this.graph?.links[this.inputs[i].link];
                         if (link) {
                             const srcNode = this.graph?.getNodeById(link.origin_id);
                             if (srcNode?.outputs?.[link.origin_slot]) {
-                                this.inputs[i].name = srcNode.outputs[link.origin_slot].name;
+                                const baseName = srcNode.outputs[link.origin_slot].name;
+                                this.inputs[i].name = uniqueInputName(this, baseName, i);
                             }
                         }
                     }
@@ -446,7 +450,6 @@ app.registerExtension({
             const refNameWidget = this.widgets?.find(w => w.name === "ref_name");
             if (refNameWidget) {
                 refNameWidget.computeSize = () => [0, -4];
-                refNameWidget.type = "hidden";
             }
 
             // Add a proper combo widget for ref name selection
