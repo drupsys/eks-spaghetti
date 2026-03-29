@@ -3,6 +3,8 @@ import { app } from "../../scripts/app.js";
 const REF_OF_NODE_TYPE = "0nedark_RefOfNode";
 const POINT_TO_NODE_TYPE = "0nedark_PointToNode";
 const SUBGRAPH_REF_TYPE = "0nedark_SubgraphRef";
+const PORTAL_IN_TYPE = "0nedark_PortalIn";
+const PORTAL_OUT_TYPE = "0nedark_PortalOut";
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function getNodeClassType(node) {
@@ -829,6 +831,30 @@ app.registerExtension({
                 }
             }
 
+            // Portal scoped _ref_trigger injection
+            for (const nodeId in result.output) {
+                const nd = result.output[nodeId];
+                if (nd.class_type !== PORTAL_OUT_TYPE) continue;
+                const refName = nd.inputs?.ref_name;
+                if (!refName) continue;
+                const parts = nodeId.split(":");
+                const scope = parts.length > 1 ? parts.slice(0, -1).join(":") : "";
+                let found = false;
+                for (const otherId in result.output) {
+                    const other = result.output[otherId];
+                    if (other.class_type !== PORTAL_IN_TYPE) continue;
+                    if (other.inputs?.ref_name !== refName) continue;
+                    const oParts = otherId.split(":");
+                    const oScope = oParts.length > 1 ? oParts.slice(0, -1).join(":") : "";
+                    if (oScope === scope) {
+                        nd.inputs["_ref_trigger"] = [otherId, 0];
+                        found = true;
+                        break;
+                    }
+                }
+                console.log(`[Portal] ${nodeId} (scope="${scope}", ref="${refName}"): trigger ${found ? "injected" : "NOT FOUND"}`);
+            }
+
             // SubgraphRef expansion
             function findExpandedPrefix(originalId) {
                 for (const pId in result.output) {
@@ -983,6 +1009,44 @@ app.registerExtension({
                 }
             }
 
+            // DEBUG: dump portal entries
+            for (const nId in result.output) {
+                const nd = result.output[nId];
+                if (nd.class_type === PORTAL_IN_TYPE || nd.class_type === PORTAL_OUT_TYPE) {
+                    console.log(`[Portal prompt] ${nId}: class=${nd.class_type}, inputs=${JSON.stringify(nd.inputs)}`);
+                }
+            }
+
+            // Portal passthrough resolution (runs AFTER SubgraphRef expansion)
+            // Replace downstream refs to PortalIn outputs with direct refs to input sources
+            for (const portalId in result.output) {
+                const portalNd = result.output[portalId];
+                if (portalNd.class_type !== PORTAL_IN_TYPE) continue;
+
+                // Build output-slot → input-source map (prompt key order, skip non-link entries)
+                const sources = [];
+                for (const [key, val] of Object.entries(portalNd.inputs)) {
+                    if (key === "ref_name" || key === "_ref_trigger") continue;
+                    if (Array.isArray(val)) sources.push(val);
+                }
+
+                // Replace downstream references
+                for (const nId in result.output) {
+                    if (nId === portalId) continue;
+                    const nd = result.output[nId];
+                    if (!nd.inputs) continue;
+                    for (const key in nd.inputs) {
+                        const val = nd.inputs[key];
+                        if (!Array.isArray(val) || String(val[0]) !== portalId) continue;
+                        if (key === "_ref_trigger") continue;
+                        const slot = val[1];
+                        if (slot < sources.length) {
+                            nd.inputs[key] = sources[slot];
+                        }
+                    }
+                }
+            }
+
             return result;
         };
     },
@@ -1051,6 +1115,364 @@ app.registerExtension({
                 // Defer sync to after graph is fully loaded
                 const self = this;
                 setTimeout(() => syncOutputsToRef(self), 200);
+            }
+        };
+    },
+});
+
+// ─── Portal registry (same-level only) ───
+
+function getPortalRegistry() {
+    const registry = {};
+    // Use the canvas's current graph (follows subgraph navigation)
+    const graph = app.canvas?.graph || app.graph;
+    if (!graph?._nodes) return registry;
+
+    for (const node of graph._nodes) {
+        if (node.type !== PORTAL_IN_TYPE) continue;
+
+        const nameWidget = node.widgets?.find(w => w.name === "ref_name");
+        const refName = nameWidget?.value || "";
+        if (!refName) continue;
+
+        const inputs = [];
+        if (node.inputs) {
+            for (let i = 0; i < node.inputs.length; i++) {
+                const input = node.inputs[i];
+                if (input.link != null) {
+                    const link = graph.links[input.link];
+                    if (link) {
+                        inputs.push({
+                            name: input.label || input.name || `in_${i}`,
+                            type: link.type || input.type || "*",
+                        });
+                    }
+                }
+            }
+        }
+
+        registry[refName] = { portalNode: node, inputs };
+    }
+
+    return registry;
+}
+
+function getPortalNameList() {
+    const registry = getPortalRegistry();
+    return ["None", ...Object.keys(registry).sort()];
+}
+
+// ─── Portal output sync ───
+
+function syncOutputsToPortal(node) {
+    const refNameWidget = node.widgets?.find(w => w.name === "ref_name");
+    const refName = refNameWidget?.value;
+    if (!refName || refName === "None" || refName === "") {
+        if (node.outputs && node.outputs.length > 0) {
+            clearOutputs(node);
+            node.title = `? -> Portal (#${node.id})`;
+            node.size = node.computeSize();
+            node.setDirtyCanvas(true, true);
+        }
+        return;
+    }
+
+    const registry = getPortalRegistry();
+    const info = registry[refName];
+    if (!info) return;
+
+    const desired = info.inputs.map(inp => ({ name: inp.name, type: inp.type }));
+    const numOutputs = node.outputs?.length || 0;
+    if (
+        numOutputs === desired.length &&
+        desired.every((d, i) => node.outputs[i].name === d.name && node.outputs[i].type === d.type)
+    ) {
+        return;
+    }
+
+    let changed = false;
+    const minLen = Math.min(node.outputs?.length || 0, desired.length);
+    for (let i = 0; i < minLen; i++) {
+        if (node.outputs[i].name !== desired[i].name || node.outputs[i].type !== desired[i].type) {
+            node.outputs[i].name = desired[i].name;
+            node.outputs[i].type = desired[i].type;
+            changed = true;
+        }
+    }
+    if (node.outputs && node.outputs.length > desired.length) {
+        for (let i = node.outputs.length - 1; i >= desired.length; i--) node.removeOutput(i);
+        changed = true;
+    }
+    for (let i = (node.outputs?.length || 0); i < desired.length; i++) {
+        node.addOutput(desired[i].name, desired[i].type);
+        changed = true;
+    }
+
+    if (changed) {
+        node.title = `${refName} -> Portal (#${node.id})`;
+        node.size = node.computeSize();
+        node.setDirtyCanvas(true, true);
+    }
+}
+
+// ─── Portal In output sync (passthrough) ───
+
+function syncPortalInOutputs(node) {
+    const desired = [];
+    if (node.inputs) {
+        for (const inp of node.inputs) {
+            if (inp.link != null && inp.name !== "...") {
+                desired.push({ name: inp.label || inp.name, type: inp.type || "*" });
+            }
+        }
+    }
+
+    const numOutputs = node.outputs?.length || 0;
+    if (
+        numOutputs === desired.length &&
+        desired.every((d, i) => node.outputs[i].name === d.name && node.outputs[i].type === d.type)
+    ) {
+        return;
+    }
+
+    let changed = false;
+    const minLen = Math.min(node.outputs?.length || 0, desired.length);
+    for (let i = 0; i < minLen; i++) {
+        if (node.outputs[i].name !== desired[i].name || node.outputs[i].type !== desired[i].type) {
+            node.outputs[i].name = desired[i].name;
+            node.outputs[i].type = desired[i].type;
+            changed = true;
+        }
+    }
+    if (node.outputs && node.outputs.length > desired.length) {
+        for (let i = node.outputs.length - 1; i >= desired.length; i--) node.removeOutput(i);
+        changed = true;
+    }
+    for (let i = (node.outputs?.length || 0); i < desired.length; i++) {
+        node.addOutput(desired[i].name, desired[i].type);
+        changed = true;
+    }
+
+    if (changed) {
+        node.size = node.computeSize();
+        node.setDirtyCanvas(true, true);
+    }
+}
+
+// ─── Portal In extension (publisher) ───
+
+app.registerExtension({
+    name: "0nedark.PortalIn",
+
+    async beforeRegisterNodeDef(nodeType, nodeData, _app) {
+        if (nodeData.name !== PORTAL_IN_TYPE) return;
+
+        const onNodeCreated = nodeType.prototype.onNodeCreated;
+        nodeType.prototype.onNodeCreated = function () {
+            if (onNodeCreated) onNodeCreated.apply(this, arguments);
+
+            if (this.inputs) while (this.inputs.length > 0) this.removeInput(0);
+            if (this.outputs) while (this.outputs.length > 0) this.removeOutput(0);
+
+            const self_init = this;
+            setTimeout(() => {
+                if (!self_init.inputs?.length) {
+                    self_init.addInput("...", "*");
+                    self_init.size = self_init.computeSize();
+                }
+            }, 0);
+
+            this.title = "Portal -> ?";
+
+            if (!this.properties) this.properties = {};
+            if (!this.properties._customInputNames) this.properties._customInputNames = {};
+
+            const self = this;
+            const nameWidget = this.widgets?.find(w => w.name === "ref_name");
+            if (nameWidget) {
+                const origCallback = nameWidget.callback;
+                nameWidget.callback = function (value) {
+                    if (origCallback) origCallback.call(this, value);
+                    self.title = value ? `Portal -> ${value}` : "Portal -> ?";
+                    self.size = self.computeSize();
+                    self.setDirtyCanvas(true, true);
+                };
+                if (nameWidget.value) this.title = `Portal -> ${nameWidget.value}`;
+            }
+        };
+
+        const origConfigure = nodeType.prototype.configure;
+        nodeType.prototype.configure = function (info) {
+            this._isRestoring = true;
+            if (origConfigure) origConfigure.apply(this, arguments);
+            this._isRestoring = false;
+        };
+
+        const onConnectionsChange = nodeType.prototype.onConnectionsChange;
+        nodeType.prototype.onConnectionsChange = function (type, slotIndex, isConnected, linkInfo, ioSlot) {
+            if (onConnectionsChange) onConnectionsChange.apply(this, arguments);
+            if (type !== 1 || !this.inputs || this._isRestoring) return;
+
+            if (isConnected && linkInfo && this.inputs[slotIndex]) {
+                const link = this.graph?.links[linkInfo.id || linkInfo];
+                if (link) {
+                    if (link.type) this.inputs[slotIndex].type = link.type;
+                    if (!this.properties._customInputNames?.[String(slotIndex)]) {
+                        const sourceNode = this.graph?.getNodeById(link.origin_id);
+                        if (sourceNode?.outputs?.[link.origin_slot]) {
+                            const baseName = sourceNode.outputs[link.origin_slot].name;
+                            this.inputs[slotIndex].name = uniqueInputName(this, baseName, slotIndex);
+                        } else {
+                            // Source not found (e.g., subgraph input node -10) — use fallback name
+                            this.inputs[slotIndex].name = `in_${slotIndex}`;
+                        }
+                    }
+                }
+            }
+
+            if (!isConnected && this.inputs[slotIndex]) this.inputs[slotIndex].type = "*";
+
+            if (this.properties._customInputNames) {
+                const oldCustom = this.properties._customInputNames;
+                const newCustom = {};
+                let newIdx = 0;
+                for (let i = 0; i < this.inputs.length; i++) {
+                    if (this.inputs[i].link != null) {
+                        if (oldCustom[String(i)]) newCustom[String(newIdx)] = oldCustom[String(i)];
+                        newIdx++;
+                    }
+                }
+                this.properties._customInputNames = newCustom;
+            }
+
+            for (let i = this.inputs.length - 1; i >= 0; i--) {
+                if (this.inputs[i].link == null && this.inputs[i].name === "..." && !this.inputs[i].label) {
+                    this.removeInput(i);
+                }
+            }
+
+            const lastInput = this.inputs[this.inputs.length - 1];
+            if (!this.inputs.length || (lastInput && lastInput.link != null)) {
+                this.addInput("...", "*");
+            }
+
+            for (let i = 0; i < this.inputs.length; i++) {
+                if (this.inputs[i].link != null) {
+                    if (this.inputs[i].label) { /* keep */ }
+                    else if (this.properties._customInputNames?.[String(i)]) {
+                        this.inputs[i].name = this.properties._customInputNames[String(i)];
+                    } else {
+                        const link = this.graph?.links[this.inputs[i].link];
+                        if (link) {
+                            const srcNode = this.graph?.getNodeById(link.origin_id);
+                            if (srcNode?.outputs?.[link.origin_slot]) {
+                                this.inputs[i].name = uniqueInputName(this, srcNode.outputs[link.origin_slot].name, i);
+                            } else if (this.inputs[i].name === "...") {
+                                this.inputs[i].name = `in_${i}`;
+                            }
+                        }
+                    }
+                }
+            }
+
+            this.size = this.computeSize();
+            this.setDirtyCanvas(true, true);
+            syncPortalInOutputs(this);
+        };
+
+        const onDrawForeground = nodeType.prototype.onDrawForeground;
+        nodeType.prototype.onDrawForeground = function (ctx) {
+            if (onDrawForeground) onDrawForeground.apply(this, arguments);
+            syncPortalInOutputs(this);
+        };
+
+        const onConfigure = nodeType.prototype.onConfigure;
+        nodeType.prototype.onConfigure = function (info) {
+            if (onConfigure) onConfigure.apply(this, arguments);
+            const nameWidget = this.widgets?.find(w => w.name === "ref_name");
+            if (nameWidget?.value) this.title = `Portal -> ${nameWidget.value}`;
+
+            const lastInput = this.inputs?.[this.inputs.length - 1];
+            if (!this.inputs?.length || (lastInput && lastInput.link != null)) {
+                this.addInput("...", "*");
+            }
+
+            if (this.outputs) {
+                for (let i = this.outputs.length - 1; i >= 0; i--) {
+                    if (this.outputs[i].name === "trigger") this.removeOutput(i);
+                }
+            }
+
+            if (info.inputs) {
+                for (let i = 0; i < info.inputs.length; i++) {
+                    if (this.inputs[i] && info.inputs[i].label) this.inputs[i].label = info.inputs[i].label;
+                }
+            }
+
+            if (this.properties._customInputNames) {
+                for (const [idx, name] of Object.entries(this.properties._customInputNames)) {
+                    const i = parseInt(idx);
+                    if (this.inputs[i]) this.inputs[i].name = name;
+                }
+            }
+        };
+    },
+});
+
+// ─── Portal Out extension (consumer) ───
+
+app.registerExtension({
+    name: "0nedark.PortalOut",
+
+    async beforeRegisterNodeDef(nodeType, nodeData, _app) {
+        if (nodeData.name !== PORTAL_OUT_TYPE) return;
+
+        const onNodeCreated = nodeType.prototype.onNodeCreated;
+        nodeType.prototype.onNodeCreated = function () {
+            if (onNodeCreated) onNodeCreated.apply(this, arguments);
+
+            clearOutputs(this);
+
+            if (!this.properties) this.properties = {};
+
+            const self = this;
+
+            const refNameWidget = this.widgets?.find(w => w.name === "ref_name");
+            if (refNameWidget) refNameWidget.computeSize = () => [0, -4];
+
+            this.portalCombo = this.addWidget(
+                "combo",
+                "select_portal",
+                refNameWidget?.value || "None",
+                function (value) {
+                    if (refNameWidget) refNameWidget.value = value === "None" ? "" : value;
+                    syncOutputsToPortal(self);
+                },
+                { values: () => getPortalNameList() }
+            );
+            this.portalCombo.serializeValue = () => undefined;
+
+            this.title = `? -> Portal (#${this.id})`;
+        };
+
+        const onDrawForeground = nodeType.prototype.onDrawForeground;
+        nodeType.prototype.onDrawForeground = function (ctx) {
+            if (onDrawForeground) onDrawForeground.apply(this, arguments);
+            syncOutputsToPortal(this);
+        };
+
+        const onConfigure = nodeType.prototype.onConfigure;
+        nodeType.prototype.onConfigure = function (info) {
+            if (onConfigure) onConfigure.apply(this, arguments);
+
+            const refNameWidget = this.widgets?.find(w => w.name === "ref_name");
+            const refName = refNameWidget?.value;
+
+            if (refName && refName !== "None" && refName !== "") {
+                this.title = `${refName} -> Portal (#${this.id})`;
+                if (this.portalCombo) this.portalCombo.value = refName;
+                const self = this;
+                setTimeout(() => syncOutputsToPortal(self), 200);
             }
         };
     },
