@@ -2,6 +2,20 @@ import { app } from "../../scripts/app.js";
 
 const REF_OF_NODE_TYPE = "0nedark_RefOfNode";
 const POINT_TO_NODE_TYPE = "0nedark_PointToNode";
+const SUBGRAPH_REF_TYPE = "0nedark_SubgraphRef";
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function getNodeClassType(node) {
+    return node.comfyClass || node.type;
+}
+
+function isGroupNode(node) {
+    const classType = getNodeClassType(node);
+    if (UUID_REGEX.test(classType)) return true;
+    // Fallback: check for proxyWidgets property (group node indicator)
+    if (node.properties && "proxyWidgets" in node.properties) return true;
+    return false;
+}
 
 // ─── Graph traversal helpers ───
 
@@ -461,6 +475,180 @@ app.registerExtension({
     },
 });
 
+// ─── Subgraph registry ───
+
+function getSubgraphRegistry() {
+    const registry = {};
+    const root = getRootGraph();
+    if (!root) return registry;
+
+    const allNodes = collectAllNodes(root);
+
+    for (const { node, graph } of allNodes) {
+        if (!isGroupNode(node)) continue;
+
+        const classType = getNodeClassType(node);
+        const name = node.title || classType;
+        if (!name) continue;
+
+        if (registry[name]) {
+            if (registry[name].classType !== classType) {
+                registry[name].ambiguous = true;
+            }
+            continue;
+        }
+
+        // Read ALL inputs/outputs from the subgraph definition (-10/-20 nodes)
+        // because the new ComfyUI frontend hides optional unconnected inputs from node.inputs
+        const inputs = [];
+        const outputs = [];
+        const sg = node.subgraph;
+
+        if (sg?._nodes) {
+            const inputNode = sg._nodes.find(n => n.id === -10);
+            if (inputNode?.outputs) {
+                for (const out of inputNode.outputs) {
+                    inputs.push({
+                        name: out.name,
+                        type: out.type || "*",
+                        label: out.label || out.name,
+                    });
+                }
+            }
+            const outputNode = sg._nodes.find(n => n.id === -20);
+            if (outputNode?.inputs) {
+                for (const inp of outputNode.inputs) {
+                    outputs.push({
+                        name: inp.name,
+                        type: inp.type || "*",
+                        label: inp.label || inp.name,
+                    });
+                }
+            }
+        }
+
+        // Fallback to node.inputs/outputs if subgraph not available
+        if (inputs.length === 0 && node.inputs) {
+            for (const inp of node.inputs) {
+                inputs.push({ name: inp.name, type: inp.type || "*", label: inp.label || inp.name });
+            }
+        }
+        if (outputs.length === 0 && node.outputs) {
+            for (const out of node.outputs) {
+                outputs.push({ name: out.name, type: out.type || "*", label: out.label || out.name });
+            }
+        }
+
+        registry[name] = { classType, node, graph, inputs, outputs, ambiguous: false };
+    }
+
+    return registry;
+}
+
+function getSubgraphNameList() {
+    const registry = getSubgraphRegistry();
+    return ["None", ...Object.keys(registry).filter(n => !registry[n].ambiguous).sort()];
+}
+
+// ─── Generic slot sync helper ───
+
+function syncSlots(node, kind, desired) {
+    const slots = node[kind] || [];
+    const addFn = kind === "inputs" ? "addInput" : "addOutput";
+    const removeFn = kind === "inputs" ? "removeInput" : "removeOutput";
+
+    let changed = false;
+    const minLen = Math.min(slots.length, desired.length);
+
+    for (let i = 0; i < minLen; i++) {
+        const d = desired[i];
+        const displayName = d.label || d.name;
+        if (slots[i].name !== d.name || slots[i].type !== d.type) {
+            slots[i].name = d.name;
+            slots[i].type = d.type;
+            changed = true;
+        }
+        if ((slots[i].label || "") !== (d.label || "")) {
+            slots[i].label = d.label || null;
+            changed = true;
+        }
+    }
+
+    for (let i = slots.length - 1; i >= desired.length; i--) {
+        node[removeFn](i);
+        changed = true;
+    }
+
+    for (let i = (node[kind]?.length || 0); i < desired.length; i++) {
+        const d = desired[i];
+        node[addFn](d.name, d.type);
+        if (d.label) {
+            node[kind][node[kind].length - 1].label = d.label;
+        }
+        changed = true;
+    }
+
+    return changed;
+}
+
+// ─── Subgraph IO sync ───
+
+function syncSubgraphIO(node) {
+    const refNameWidget = node.widgets?.find(w => w.name === "ref_name");
+    const refName = refNameWidget?.value;
+
+    if (!refName || refName === "None" || refName === "") {
+        const hadSlots = (node.inputs?.length || 0) + (node.outputs?.length || 0) > 0;
+        if (hadSlots) {
+            if (node.inputs) while (node.inputs.length > 0) node.removeInput(0);
+            clearOutputs(node);
+            node.properties._subgraph_inputs = null;
+            node.properties._subgraph_outputs = null;
+            node.title = "Copy -> ?";
+            node.size = node.computeSize();
+            node.setDirtyCanvas(true, true);
+        }
+        return;
+    }
+
+    const registry = getSubgraphRegistry();
+    const info = registry[refName];
+
+    // If not found or ambiguous, keep last known state
+    if (!info || info.ambiguous) return;
+
+    const desiredInputs = info.inputs;
+    const desiredOutputs = info.outputs;
+
+    // Check if already in sync
+    const inputsMatch = (node.inputs?.length || 0) === desiredInputs.length &&
+        desiredInputs.every((d, i) => node.inputs[i].name === d.name && node.inputs[i].type === d.type);
+    const outputsMatch = (node.outputs?.length || 0) === desiredOutputs.length &&
+        desiredOutputs.every((d, i) => node.outputs[i].name === d.name && node.outputs[i].type === d.type);
+
+    if (inputsMatch && outputsMatch) {
+        // Ensure properties are stored
+        if (!node.properties._subgraph_uuid || node.properties._subgraph_uuid !== info.uuid) {
+            node.properties._subgraph_uuid = info.classType;
+            node.properties._subgraph_inputs = desiredInputs;
+            node.properties._subgraph_outputs = desiredOutputs;
+        }
+        return;
+    }
+
+    const inputsChanged = syncSlots(node, "inputs", desiredInputs);
+    const outputsChanged = syncSlots(node, "outputs", desiredOutputs);
+
+    if (inputsChanged || outputsChanged) {
+        node.properties._subgraph_uuid = info.classType;
+        node.properties._subgraph_inputs = desiredInputs;
+        node.properties._subgraph_outputs = desiredOutputs;
+        node.title = `Copy -> ${refName}`;
+        node.size = node.computeSize();
+        node.setDirtyCanvas(true, true);
+    }
+}
+
 // ─── Node Ref extension (consumer) ───
 
 /**
@@ -582,34 +770,217 @@ app.registerExtension({
     },
 
     async setup() {
-        // Patch graphToPrompt to inject _ref_trigger dependency from RefNode to NodeRef
         const origGraphToPrompt = app.graphToPrompt;
         app.graphToPrompt = async function () {
-            const result = await origGraphToPrompt.apply(this, arguments);
-            if (!result || !result.output) return result;
+            const rootGraph = getRootGraph();
+            const subgraphReg = rootGraph ? getSubgraphRegistry() : {};
+            const dummies = [];
 
-            // Build map: ref_name -> refNode prompt ID
-            const refNodeMap = {};
-            for (const nodeId in result.output) {
-                const nodeData = result.output[nodeId];
-                if (nodeData.class_type === REF_OF_NODE_TYPE) {
-                    const name = nodeData.inputs?.ref_name;
-                    if (name) {
-                        refNodeMap[name] = nodeId;
+            if (rootGraph) {
+                const referencedGroups = new Set();
+                for (const { node } of collectAllNodes(rootGraph)) {
+                    if (node.type !== SUBGRAPH_REF_TYPE) continue;
+                    const w = node.widgets?.find(w => w.name === "ref_name");
+                    if (w?.value && w.value !== "None" && subgraphReg[w.value]) {
+                        referencedGroups.add(w.value);
+                    }
+                }
+                for (const refName of referencedGroups) {
+                    const info = subgraphReg[refName];
+                    if (!info.node.inputs) continue;
+                    for (let i = 0; i < info.node.inputs.length; i++) {
+                        if (info.node.inputs[i].link != null) continue;
+                        const dummy = LiteGraph.createNode("PrimitiveInt");
+                        if (!dummy) continue;
+                        dummy.pos = [info.node.pos[0] - 300, info.node.pos[1]];
+                        info.graph.add(dummy);
+                        dummy.connect(0, info.node, i);
+                        dummies.push({ graph: info.graph, dummy, node: info.node, slot: i });
                     }
                 }
             }
 
-            // For each NodeRef, inject _ref_trigger link to matching RefNode
+            const result = await origGraphToPrompt.apply(this, arguments);
+
+            // ─── Phase 2b: Remove dummies ───
+            for (const { graph, dummy, node, slot } of dummies) {
+                node.disconnectInput(slot);
+                graph.remove(dummy);
+            }
+
+            if (!result || !result.output) return result;
+
+            // Note: dummy PrimitiveInt entries stay in the prompt — they're harmless.
+            // Removing them would leave dangling refs in the original group's expansion.
+
+            // RefNode/NodeRef _ref_trigger injection
+            const refNodeMap = {};
             for (const nodeId in result.output) {
-                const nodeData = result.output[nodeId];
-                if (nodeData.class_type !== POINT_TO_NODE_TYPE) continue;
+                if (result.output[nodeId].class_type === REF_OF_NODE_TYPE) {
+                    const name = result.output[nodeId].inputs?.ref_name;
+                    if (name) refNodeMap[name] = nodeId;
+                }
+            }
+            for (const nodeId in result.output) {
+                if (result.output[nodeId].class_type !== POINT_TO_NODE_TYPE) continue;
+                const refName = result.output[nodeId].inputs?.ref_name;
+                if (refName && refNodeMap[refName]) {
+                    result.output[nodeId].inputs["_ref_trigger"] = [refNodeMap[refName], 0];
+                }
+            }
 
-                const refName = nodeData.inputs?.ref_name;
-                if (!refName || !refNodeMap[refName]) continue;
+            // SubgraphRef expansion
+            function findExpandedPrefix(originalId) {
+                for (const pId in result.output) {
+                    if (pId.startsWith(originalId + ":")) return originalId;
+                    const idx = pId.indexOf(":" + originalId + ":");
+                    if (idx >= 0) return pId.substring(0, idx + 1 + originalId.length);
+                }
+                return null;
+            }
 
-                // Inject trigger dependency: [refnode_id, 0] (output slot 0 = trigger)
-                nodeData.inputs["_ref_trigger"] = [refNodeMap[refName], 0];
+            function tryExpandRef(refNodeId, refNodeData) {
+                const refName = refNodeData.inputs?.ref_name;
+                if (!refName || refName === "None") { delete result.output[refNodeId]; return true; }
+                const info = subgraphReg[refName];
+                if (!info) return false;
+                if (info.ambiguous) throw new Error(`[&Subgraph] Ambiguous: "${refName}".`);
+
+                const expandedPrefix = findExpandedPrefix(String(info.node.id));
+                if (!expandedPrefix) return false;
+
+                const expandedNodes = {};
+                for (const pId in result.output) {
+                    if (pId.startsWith(expandedPrefix + ":")) expandedNodes[pId] = result.output[pId];
+                }
+
+                const sg = info.node.subgraph;
+                if (!sg?.links) return false;
+
+                // Input mapping from -10
+                const inputMap = {};
+                for (const lId in sg.links) {
+                    const l = sg.links[lId];
+                    if (!l || l.origin_id !== -10) continue;
+                    const n = sg._nodes?.find(n => n.id === l.target_id);
+                    if (!n) continue;
+                    const name = n.inputs?.[l.target_slot]?.name;
+                    if (name == null) continue;
+                    if (!inputMap[l.origin_slot]) inputMap[l.origin_slot] = [];
+                    inputMap[l.origin_slot].push({ nodeId: String(l.target_id), name });
+                }
+
+                // Output mapping to -20
+                const outputMap = {};
+                for (const lId in sg.links) {
+                    const l = sg.links[lId];
+                    if (!l || l.target_id !== -20) continue;
+                    outputMap[l.target_slot] = { nodeId: String(l.origin_id), slot: l.origin_slot };
+                }
+
+                // &Subgraph's inputs by slot (use registry inputs which include all slots)
+                const refInputs = {};
+                for (let i = 0; i < info.inputs.length; i++) {
+                    const val = refNodeData.inputs[info.inputs[i].name];
+                    if (val !== undefined) refInputs[i] = val;
+                }
+                // Clone with new prefix
+                const newPrefix = refNodeId;
+                for (const [oldId, oldData] of Object.entries(expandedNodes)) {
+                    const suffix = oldId.substring(expandedPrefix.length);
+                    const cloned = JSON.parse(JSON.stringify(oldData));
+                    for (const key in cloned.inputs) {
+                        const val = cloned.inputs[key];
+                        if (!Array.isArray(val)) continue;
+                        const src = String(val[0]);
+                        if (src.startsWith(expandedPrefix + ":")) {
+                            cloned.inputs[key] = [newPrefix + src.substring(expandedPrefix.length), val[1]];
+                        }
+                    }
+                    result.output[newPrefix + suffix] = cloned;
+                }
+
+                // Follow reroute chains for optimized-away nodes
+                function resolveTarget(targetId) {
+                    const resolved = [];
+                    for (const lId in sg.links) {
+                        const l = sg.links[lId];
+                        if (!l || String(l.origin_id) !== targetId) continue;
+                        const destCloneId = newPrefix + ":" + String(l.target_id);
+                        if (result.output[destCloneId]) {
+                            const dn = sg._nodes?.find(n => n.id === l.target_id);
+                            const dn_name = dn?.inputs?.[l.target_slot]?.name;
+                            if (dn_name != null) resolved.push({ nodeId: String(l.target_id), name: dn_name });
+                        } else {
+                            resolved.push(...resolveTarget(String(l.target_id)));
+                        }
+                    }
+                    return resolved;
+                }
+
+                // Override external inputs (resolve through optimized-away reroutes)
+                for (const [slot, targets] of Object.entries(inputMap)) {
+                    const val = refInputs[parseInt(slot)];
+                    if (val === undefined) continue;
+                    for (const { nodeId, name } of targets) {
+                        const id = newPrefix + ":" + nodeId;
+                        if (result.output[id]) {
+                            result.output[id].inputs[name] = val;
+                        } else {
+                            for (const r of resolveTarget(nodeId)) {
+                                const rId = newPrefix + ":" + r.nodeId;
+                                if (result.output[rId]) result.output[rId].inputs[r.name] = val;
+                            }
+                        }
+                    }
+                }
+
+                // Remap output references
+                for (const pId in result.output) {
+                    if (pId === refNodeId) continue;
+                    const nd = result.output[pId];
+                    if (!nd?.inputs) continue;
+                    for (const key in nd.inputs) {
+                        const val = nd.inputs[key];
+                        if (!Array.isArray(val) || String(val[0]) !== refNodeId) continue;
+                        const m = outputMap[val[1]];
+                        if (m) nd.inputs[key] = [newPrefix + ":" + m.nodeId, m.slot];
+                    }
+                }
+
+                delete result.output[refNodeId];
+                return true;
+            }
+
+            // Iterative: defer refs inside another ref's expansion source
+            for (let pass = 0; pass < 10; pass++) {
+                const refs = [];
+                for (const nId in result.output) {
+                    if (result.output[nId].class_type === SUBGRAPH_REF_TYPE) refs.push(nId);
+                }
+                if (refs.length === 0) break;
+
+                const refPrefixes = {};
+                for (const nId of refs) {
+                    const rn = result.output[nId].inputs?.ref_name;
+                    const inf = rn ? subgraphReg[rn] : null;
+                    if (inf) { const p = findExpandedPrefix(String(inf.node.id)); if (p) refPrefixes[nId] = p; }
+                }
+
+                let any = false;
+                for (const nId of refs) {
+                    if (!result.output[nId]) continue;
+                    let inside = false;
+                    for (const [oId, p] of Object.entries(refPrefixes)) {
+                        if (oId !== nId && nId.startsWith(p + ":")) { inside = true; break; }
+                    }
+                    if (inside) continue;
+                    if (tryExpandRef(nId, result.output[nId])) any = true;
+                }
+                if (!any) {
+                    for (const nId of refs) { if (result.output[nId]) delete result.output[nId]; }
+                    break;
+                }
             }
 
             return result;
@@ -680,6 +1051,125 @@ app.registerExtension({
                 // Defer sync to after graph is fully loaded
                 const self = this;
                 setTimeout(() => syncOutputsToRef(self), 200);
+            }
+        };
+    },
+});
+
+// ─── Subgraph Ref extension ───
+
+app.registerExtension({
+    name: "0nedark.SubgraphRef",
+
+    commands: [{
+        id: "0nedark.goto-subgraph",
+        label: "Goto",
+        icon: "pi pi-arrow-left",
+        function: async () => {
+            const selected = Object.values(app.canvas.selected_nodes || {});
+            const node = selected.find(n => n.type === SUBGRAPH_REF_TYPE);
+            if (!node) return;
+            const refNameW = node.widgets?.find(w => w.name === "ref_name");
+            const name = refNameW?.value;
+            if (!name || name === "None" || name === "") return;
+
+            const registry = getSubgraphRegistry();
+            const info = registry[name];
+            if (!info || !info.node) return;
+
+            const canvas = app.canvas;
+            if (!canvas) return;
+
+            const currentGraph = canvas.getCurrentGraph?.() ?? canvas.graph;
+            if (info.graph && info.graph !== currentGraph) {
+                const fromNode = info.graph._subgraph_node || null;
+                canvas.openSubgraph(info.graph, fromNode);
+                await new Promise(r => setTimeout(r, 16));
+            }
+
+            canvas.centerOnNode(info.node);
+            canvas.selectNode(info.node, false);
+            canvas.setDirty(true, true);
+        }
+    }],
+
+    getSelectionToolboxCommands(selectedItem) {
+        if (selectedItem?.type === SUBGRAPH_REF_TYPE) return ["0nedark.goto-subgraph"];
+        return [];
+    },
+
+    async beforeRegisterNodeDef(nodeType, nodeData, _app) {
+        if (nodeData.name !== SUBGRAPH_REF_TYPE) return;
+
+        const onNodeCreated = nodeType.prototype.onNodeCreated;
+        nodeType.prototype.onNodeCreated = function () {
+            if (onNodeCreated) onNodeCreated.apply(this, arguments);
+
+            // Wipe default inputs/outputs
+            if (this.inputs) while (this.inputs.length > 0) this.removeInput(0);
+            if (this.outputs) while (this.outputs.length > 0) this.removeOutput(0);
+
+            if (!this.properties) this.properties = {};
+            this.properties._subgraph_inputs = null;
+            this.properties._subgraph_outputs = null;
+            this.properties._subgraph_uuid = null;
+
+            this.title = "&Subgraph";
+
+            const self = this;
+
+            // Hide the backend's STRING widget and add a combo dropdown
+            const refNameWidget = this.widgets?.find(w => w.name === "ref_name");
+            if (refNameWidget) {
+                refNameWidget.computeSize = () => [0, -4];
+            }
+
+            this.subgraphCombo = this.addWidget(
+                "combo",
+                "select_subgraph",
+                refNameWidget?.value || "None",
+                function (value) {
+                    if (refNameWidget) {
+                        refNameWidget.value = value === "None" ? "" : value;
+                    }
+                    syncSubgraphIO(self);
+                },
+                { values: () => getSubgraphNameList() }
+            );
+            this.subgraphCombo.serializeValue = () => undefined;
+        };
+
+        const onDrawForeground = nodeType.prototype.onDrawForeground;
+        nodeType.prototype.onDrawForeground = function (ctx) {
+            if (onDrawForeground) onDrawForeground.apply(this, arguments);
+            syncSubgraphIO(this);
+        };
+
+        const onConfigure = nodeType.prototype.onConfigure;
+        nodeType.prototype.onConfigure = function (info) {
+            if (onConfigure) onConfigure.apply(this, arguments);
+
+            const refNameWidget = this.widgets?.find(w => w.name === "ref_name");
+            const refName = refNameWidget?.value;
+
+            if (refName && refName !== "None" && refName !== "") {
+                this.title = `&${refName}`;
+
+                if (this.subgraphCombo) {
+                    this.subgraphCombo.value = refName;
+                }
+
+                // Restore from properties if available
+                if (this.properties._subgraph_inputs) {
+                    syncSlots(this, "inputs", this.properties._subgraph_inputs);
+                }
+                if (this.properties._subgraph_outputs) {
+                    syncSlots(this, "outputs", this.properties._subgraph_outputs);
+                }
+
+                // Defer full sync to after graph is loaded
+                const self = this;
+                setTimeout(() => syncSubgraphIO(self), 200);
             }
         };
     },

@@ -105,14 +105,45 @@ class NodeRef:
         return tuple(result)
 
 
+class SubgraphRef:
+    """Reference a Group Node by name — acts as an independent function call."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "ref_name": ("STRING", {"default": ""}),
+            },
+            "optional": FlexibleOptionalInputType(any_type),
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            },
+        }
+
+    RETURN_TYPES = tuple([any_type] * MAX_OUTPUTS)
+    RETURN_NAMES = tuple([f"out_{i}" for i in range(MAX_OUTPUTS)])
+    FUNCTION = "execute"
+    CATEGORY = "utils"
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, **kwargs):
+        return True
+
+    def execute(self, ref_name="", unique_id=None, **kwargs):
+        # Should not be called — graphToPrompt rewrites class_type to the group node UUID
+        return tuple([ExecutionBlocker(None)] * MAX_OUTPUTS)
+
+
 NODE_CLASS_MAPPINGS = {
     "0nedark_RefOfNode": RefNode,
     "0nedark_PointToNode": NodeRef,
+    "0nedark_SubgraphRef": SubgraphRef,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "0nedark_RefOfNode": "&Node",
     "0nedark_PointToNode": "*Node",
+    "0nedark_SubgraphRef": "Copy -> Subgraph",
 }
 
 WEB_DIRECTORY = "./web/js"
